@@ -8,6 +8,9 @@ from pulp import LpProblem, LpVariable, lpSum, LpMaximize, PULP_CBC_CMD, LpStatu
 SALARY_CAP = 60000
 ROSTER_SLOTS = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1, "DEF": 1}
 TOTAL_ROSTER = sum(v for k, v in ROSTER_SLOTS.items() if k != "FLEX") + ROSTER_SLOTS["FLEX"]
+SINGLE_GAME_SALARY = 60000
+SINGLE_GAME_PLAYERS = 6
+MVP_MULTIPLIER = 1.5
 
 # === UTILS ===
 def canonical_position(pos_raw):
@@ -29,13 +32,11 @@ def canonical_position(pos_raw):
 def extract_points(p, use_fppg=False, stats_for="current"):
     if not use_fppg:
         return float(p.get("projected_fantasy_points", {}).get("projected_fantasy_points", 0.0))
-
     stats_for_lower = stats_for.lower()
     if stats_for_lower == "current":
         val = p.get("fppg")
         if val is not None:
             return float(val)
-
     recent_stats = p.get("recent_games_played_stats", {})
     key_map = {"last3": "LAST_3", "last5": "LAST_5", "last10": "LAST_10"}
     key = key_map.get(stats_for_lower)
@@ -43,17 +44,28 @@ def extract_points(p, use_fppg=False, stats_for="current"):
         val = recent_stats[key].get("fppg")
         if val is not None:
             return float(val)
-
     return float(p.get("projected_fantasy_points", {}).get("projected_fantasy_points", 0.0))
 
-def check_availability(df_pool):
+def check_availability(df_pool, single_game_mode=False):
     reasons = []
-    for pos in ("QB","RB","WR","TE","DEF"):
-        if df_pool[df_pool["position"]==pos].shape[0] < ROSTER_SLOTS[pos]:
-            reasons.append(f"Not enough {pos}")
-    if df_pool.shape[0] < TOTAL_ROSTER:
-        reasons.append("Not enough total players")
+    if single_game_mode:
+        if df_pool.shape[0] < SINGLE_GAME_PLAYERS:
+            reasons.append("Not enough total players")
+    else:
+        for pos in ("QB","RB","WR","TE","DEF"):
+            if df_pool[df_pool["position"]==pos].shape[0] < ROSTER_SLOTS[pos]:
+                reasons.append(f"Not enough {pos}")
+        if df_pool.shape[0] < TOTAL_ROSTER:
+            reasons.append("Not enough total players")
     return reasons
+
+def detect_game_type(players):
+    """Detect if the JSON is for a Standard Game or Single Game."""
+    positions = [canonical_position(p.get("position")) for p in players if p.get("draftable", False)]
+    unique_positions = set(positions)
+    if len(players) <= 75 or unique_positions <= {"RB","WR","TE","FLEX"}:
+        return "Single Game"
+    return "Standard Game"
 
 # === STREAMLIT APP ===
 st.title("FanDuel NFL Lineup Optimizer")
@@ -64,6 +76,12 @@ if uploaded_file:
     data = json.load(uploaded_file)
     raw_players = data.get("players") or data.get("_items") or []
 
+    # Detect game type
+    game_type = detect_game_type(raw_players)
+    single_game_mode = (game_type == "Single Game")
+    st.sidebar.markdown(f"**Detected Game Type:** {game_type}")
+
+    # --- Load players ---
     players = []
     for p in raw_players:
         if not p.get("draftable", False):
@@ -89,7 +107,7 @@ if uploaded_file:
 
     # --- Filters ---
     st.sidebar.header("Filters")
-    top_n = st.sidebar.number_input("Top N Lineups", min_value=1, max_value=20, value=5, step=1)
+    top_n = st.sidebar.number_input("Top N Lineups", min_value=1, max_value=100, value=5, step=1)
     min_dvp = st.sidebar.number_input("Min DVP Rank", value=0, step=1)
     min_salary = st.sidebar.number_input("Min Salary", value=0, step=100)
     max_salary = st.sidebar.number_input("Max Salary", value=0, step=100)
@@ -97,7 +115,7 @@ if uploaded_file:
     stats_for = st.sidebar.selectbox("Stats For", ["current","last3","last5","last10"])
     exclude_injured = st.sidebar.checkbox("Exclude Injured Players", value=False)
 
-    # --- Include/Exclude players (collapsible) ---
+    # --- Include/Exclude players ---
     with st.expander("Include/Exclude Players", expanded=False):
         st.markdown("Select players to **force include** or **force exclude** in lineups.")
         include_ids = []
@@ -128,61 +146,112 @@ if uploaded_file:
         df = df[~df["id"].isin(exclude_ids)]
 
         # Check feasibility
-        reasons = check_availability(df)
+        reasons = check_availability(df, single_game_mode)
         if reasons:
             st.error("No feasible lineup: " + "/".join(reasons))
         else:
-            # Optimization
             solver = PULP_CBC_CMD(msg=False)
             df_pool = df.reset_index(drop=True).copy()
             df_pool["points"] = [extract_points(p["raw"], use_fppg, stats_for) for _, p in df_pool.iterrows()]
             x_vars = {i: LpVariable(f"p_{i}", cat="Binary") for i in df_pool.index}
 
-            # Base problem and constraints
-            base_prob = LpProblem("NFL_DFS", LpMaximize)
-            base_prob += lpSum(x_vars[i] * df_pool.at[i,"points"] for i in df_pool.index)
-            base_prob += lpSum(x_vars[i] * df_pool.at[i,"salary"] for i in df_pool.index) <= SALARY_CAP
-            for pos in ("QB","DEF"):
-                base_prob += lpSum(x_vars[i] for i in df_pool.index if df_pool.at[i,"position"]==pos) == ROSTER_SLOTS[pos]
-            for pos in ("RB","WR","TE"):
-                base_prob += lpSum(x_vars[i] for i in df_pool.index if df_pool.at[i,"position"]==pos) >= ROSTER_SLOTS[pos]
-            base_prob += lpSum(x_vars.values()) == TOTAL_ROSTER
-
-            # Force include
-            include_indices = df_pool.index[df_pool["id"].isin(include_ids)].tolist()
-            for i in include_indices:
-                x_vars[i].setInitialValue(1)
-                x_vars[i].fixValue()
-
-            # Generate Top N lineups
             all_lineups = []
-            prob = base_prob
-            for n in range(top_n):
-                prob.solve(solver)
-                if LpStatus[prob.status] != "Optimal":
-                    break
-                chosen = [i for i in x_vars if x_vars[i].value()==1]
-                chosen_df = df_pool.loc[chosen].copy()
-                # FLEX detection
-                counts = chosen_df["position"].value_counts().to_dict()
-                flex_pos = None
-                for pos in ("RB","WR","TE"):
-                    if counts.get(pos,0) > ROSTER_SLOTS[pos]:
-                        flex_pos = pos
-                        break
-                chosen_df["slot"] = chosen_df["position"]
-                if flex_pos:
-                    candidates = chosen_df[chosen_df["position"]==flex_pos].sort_values("points")
-                    if not candidates.empty:
-                        chosen_df.at[candidates.index[0], "slot"] = "FLEX"
-                slot_order = {"QB":0,"RB":1,"WR":2,"TE":3,"FLEX":4,"DEF":5}
-                chosen_df["slot_sort"] = chosen_df["slot"].map(slot_order).fillna(99)
-                chosen_df = chosen_df.sort_values(["slot_sort","points"], ascending=[True,False]).drop(columns=["slot_sort"])
-                all_lineups.append(chosen_df)
-                # Add exclusion constraint to avoid duplicates
-                prob += lpSum([x_vars[i] for i in chosen]) <= len(chosen)-1
 
-            # Display lineups
+            if single_game_mode:
+                # --- Single Game Top-N with MVP ---
+                include_indices = df_pool.index[df_pool["id"].isin(include_ids)].tolist()
+                previous_lineups = []
+
+                for n in range(top_n):
+                    best_lineup = None
+                    best_points = -1
+                    best_mvp_idx = None
+
+                    for mvp_idx in df_pool.index:
+                        temp_vars = {i: LpVariable(f"tmp_{i}", cat="Binary") for i in df_pool.index}
+                        temp_prob = LpProblem("NFL_SINGLE_GAME", LpMaximize)
+
+                        temp_prob += lpSum(
+                            temp_vars[i]*(df_pool.at[i,"points"]*MVP_MULTIPLIER if i==mvp_idx else df_pool.at[i,"points"])
+                            for i in df_pool.index
+                        )
+
+                        temp_prob += lpSum(
+                            temp_vars[i]*(df_pool.at[i,"salary"]*MVP_MULTIPLIER if i==mvp_idx else df_pool.at[i,"salary"])
+                            for i in df_pool.index
+                        ) <= SINGLE_GAME_SALARY
+
+                        temp_prob += lpSum(temp_vars.values()) == SINGLE_GAME_PLAYERS
+
+                        # Force include players
+                        for i in include_indices:
+                            temp_vars[i].setInitialValue(1)
+                            temp_vars[i].fixValue()
+
+                        # Exclude previous lineups
+                        for lineup in previous_lineups:
+                            temp_prob += lpSum(temp_vars[i] for i in lineup) <= SINGLE_GAME_PLAYERS - 1
+
+                        temp_prob.solve(solver)
+
+                        if LpStatus[temp_prob.status]=="Optimal":
+                            chosen = [i for i in temp_vars if temp_vars[i].value()==1]
+                            pts = sum(df_pool.at[i,"points"]*MVP_MULTIPLIER if i==mvp_idx else df_pool.at[i,"points"] for i in chosen)
+                            if pts > best_points:
+                                best_points = pts
+                                best_lineup = chosen
+                                best_mvp_idx = mvp_idx
+
+                    if best_lineup:
+                        chosen_df = df_pool.loc[best_lineup].copy()
+                        chosen_df["slot"] = "Player"
+                        chosen_df.at[best_mvp_idx,"slot"] = "MVP"
+                        chosen_df.at[best_mvp_idx,"points"] *= MVP_MULTIPLIER
+                        chosen_df.at[best_mvp_idx,"salary"] *= MVP_MULTIPLIER
+                        all_lineups.append(chosen_df)
+                        previous_lineups.append(best_lineup)
+
+            else:
+                # --- Standard Game Top-N ---
+                base_prob = LpProblem("NFL_DFS", LpMaximize)
+                base_prob += lpSum(x_vars[i] * df_pool.at[i,"points"] for i in df_pool.index)
+                base_prob += lpSum(x_vars[i] * df_pool.at[i,"salary"] for i in df_pool.index) <= SALARY_CAP
+                for pos in ("QB","DEF"):
+                    base_prob += lpSum(x_vars[i] for i in df_pool.index if df_pool.at[i,"position"]==pos) == ROSTER_SLOTS[pos]
+                for pos in ("RB","WR","TE"):
+                    base_prob += lpSum(x_vars[i] for i in df_pool.index if df_pool.at[i,"position"]==pos) >= ROSTER_SLOTS[pos]
+                base_prob += lpSum(x_vars.values()) == TOTAL_ROSTER
+
+                include_indices = df_pool.index[df_pool["id"].isin(include_ids)].tolist()
+                for i in include_indices:
+                    x_vars[i].setInitialValue(1)
+                    x_vars[i].fixValue()
+
+                prob = base_prob
+                for n in range(top_n):
+                    prob.solve(solver)
+                    if LpStatus[prob.status] != "Optimal":
+                        break
+                    chosen = [i for i in x_vars if x_vars[i].value()==1]
+                    chosen_df = df_pool.loc[chosen].copy()
+                    counts = chosen_df["position"].value_counts().to_dict()
+                    flex_pos = None
+                    for pos in ("RB","WR","TE"):
+                        if counts.get(pos,0) > ROSTER_SLOTS[pos]:
+                            flex_pos = pos
+                            break
+                    chosen_df["slot"] = chosen_df["position"]
+                    if flex_pos:
+                        candidates = chosen_df[chosen_df["position"]==flex_pos].sort_values("points")
+                        if not candidates.empty:
+                            chosen_df.at[candidates.index[0], "slot"] = "FLEX"
+                    slot_order = {"QB":0,"RB":1,"WR":2,"TE":3,"FLEX":4,"DEF":5}
+                    chosen_df["slot_sort"] = chosen_df["slot"].map(slot_order).fillna(99)
+                    chosen_df = chosen_df.sort_values(["slot_sort","points"], ascending=[True,False]).drop(columns=["slot_sort"])
+                    all_lineups.append(chosen_df)
+                    prob += lpSum([x_vars[i] for i in chosen]) <= len(chosen)-1
+
+            # --- Display lineups ---
             for idx, lineup in enumerate(all_lineups,1):
                 st.subheader(f"=== LINEUP {idx} ===")
                 st.dataframe(lineup[["name","slot","position","salary","points","dvp_rank","injury_status"]])
