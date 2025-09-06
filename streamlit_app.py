@@ -8,6 +8,7 @@ from pulp import LpProblem, LpVariable, lpSum, LpMaximize, PULP_CBC_CMD, LpStatu
 SALARY_CAP = 60000
 ROSTER_SLOTS = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1, "DEF": 1}
 TOTAL_ROSTER = sum(v for k, v in ROSTER_SLOTS.items() if k != "FLEX") + ROSTER_SLOTS["FLEX"]
+
 SINGLE_GAME_SALARY = 60000
 SINGLE_GAME_PLAYERS = 6
 MVP_MULTIPLIER = 1.5
@@ -60,12 +61,20 @@ def check_availability(df_pool, single_game_mode=False):
     return reasons
 
 def detect_game_type(players):
-    """Detect if the JSON is for a Standard Game or Single Game."""
     positions = [canonical_position(p.get("position")) for p in players if p.get("draftable", False)]
     unique_positions = set(positions)
+    # Small player pool or only skill positions → Single Game
     if len(players) <= 75 or unique_positions <= {"RB","WR","TE","FLEX"}:
         return "Single Game"
     return "Standard Game"
+
+def get_team_code(player_team, teams):
+    if isinstance(player_team, dict) and "_members" in player_team:
+        team_id = player_team["_members"][0]
+        for t in teams:
+            if str(t.get("id")) == str(team_id):
+                return t.get("code")
+    return None
 
 # === STREAMLIT APP ===
 st.title("FanDuel NFL Lineup Optimizer")
@@ -75,13 +84,13 @@ uploaded_file = st.file_uploader("Upload Players JSON", type=["json"])
 if uploaded_file:
     data = json.load(uploaded_file)
     raw_players = data.get("players") or data.get("_items") or []
+    teams_json = data.get("teams") or []
 
     # Detect game type
     game_type = detect_game_type(raw_players)
     single_game_mode = (game_type == "Single Game")
     st.sidebar.markdown(f"**Detected Game Type:** {game_type}")
 
-    # --- Load players ---
     players = []
     for p in raw_players:
         if not p.get("draftable", False):
@@ -92,22 +101,23 @@ if uploaded_file:
         except:
             continue
         pos = canonical_position(p.get("position"))
+        team_code = get_team_code(p.get("team"), teams_json)
         players.append({
             "id": p.get("id"),
             "name": f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
             "position": pos,
             "salary": sal,
             "points": proj,
+            "team": team_code,
             "dvp_rank": p.get("dvp_rank"),
             "injury_status": p.get("injury_status"),
-            "team": p.get("team"),
             "raw": p,
         })
     df_all = pd.DataFrame(players)
 
     # --- Filters ---
     st.sidebar.header("Filters")
-    top_n = st.sidebar.number_input("Top N Lineups", min_value=1, max_value=100, value=5, step=1)
+    top_n = st.sidebar.number_input("Top N Lineups", min_value=1, max_value=20, value=5, step=1)
     min_dvp = st.sidebar.number_input("Min DVP Rank", value=0, step=1)
     min_salary = st.sidebar.number_input("Min Salary", value=0, step=100)
     max_salary = st.sidebar.number_input("Max Salary", value=0, step=100)
@@ -154,65 +164,62 @@ if uploaded_file:
             df_pool = df.reset_index(drop=True).copy()
             df_pool["points"] = [extract_points(p["raw"], use_fppg, stats_for) for _, p in df_pool.iterrows()]
             x_vars = {i: LpVariable(f"p_{i}", cat="Binary") for i in df_pool.index}
-
             all_lineups = []
 
             if single_game_mode:
-                # --- Single Game Top-N with MVP ---
                 include_indices = df_pool.index[df_pool["id"].isin(include_ids)].tolist()
-                previous_lineups = []
+                used_lineups = []
 
                 for n in range(top_n):
                     best_lineup = None
                     best_points = -1
-                    best_mvp_idx = None
+                    best_mvp = None
 
+                    # Try each player as MVP
                     for mvp_idx in df_pool.index:
                         temp_vars = {i: LpVariable(f"tmp_{i}", cat="Binary") for i in df_pool.index}
                         temp_prob = LpProblem("NFL_SINGLE_GAME", LpMaximize)
 
+                        # Objective
                         temp_prob += lpSum(
                             temp_vars[i]*(df_pool.at[i,"points"]*MVP_MULTIPLIER if i==mvp_idx else df_pool.at[i,"points"])
                             for i in df_pool.index
                         )
-
+                        # Salary
                         temp_prob += lpSum(
                             temp_vars[i]*(df_pool.at[i,"salary"]*MVP_MULTIPLIER if i==mvp_idx else df_pool.at[i,"salary"])
                             for i in df_pool.index
                         ) <= SINGLE_GAME_SALARY
-
+                        # Number of players
                         temp_prob += lpSum(temp_vars.values()) == SINGLE_GAME_PLAYERS
-
-                        # Force include players
+                        # Include forced players
                         for i in include_indices:
                             temp_vars[i].setInitialValue(1)
                             temp_vars[i].fixValue()
-
                         # Exclude previous lineups
-                        for lineup in previous_lineups:
-                            temp_prob += lpSum(temp_vars[i] for i in lineup) <= SINGLE_GAME_PLAYERS - 1
+                        for used in used_lineups:
+                            temp_prob += lpSum(temp_vars[i] for i in used) <= SINGLE_GAME_PLAYERS - 1
 
                         temp_prob.solve(solver)
-
-                        if LpStatus[temp_prob.status]=="Optimal":
-                            chosen = [i for i in temp_vars if temp_vars[i].value()==1]
+                        if LpStatus[temp_prob.status] == "Optimal":
+                            chosen = [i for i in temp_vars if temp_vars[i].value() == 1]
                             pts = sum(df_pool.at[i,"points"]*MVP_MULTIPLIER if i==mvp_idx else df_pool.at[i,"points"] for i in chosen)
                             if pts > best_points:
                                 best_points = pts
                                 best_lineup = chosen
-                                best_mvp_idx = mvp_idx
+                                best_mvp = mvp_idx
 
                     if best_lineup:
                         chosen_df = df_pool.loc[best_lineup].copy()
                         chosen_df["slot"] = "Player"
-                        chosen_df.at[best_mvp_idx,"slot"] = "MVP"
-                        chosen_df.at[best_mvp_idx,"points"] *= MVP_MULTIPLIER
-                        chosen_df.at[best_mvp_idx,"salary"] *= MVP_MULTIPLIER
+                        chosen_df.at[best_mvp,"slot"] = "MVP"
+                        chosen_df.at[best_mvp,"points"] *= MVP_MULTIPLIER
+                        chosen_df.at[best_mvp,"salary"] *= MVP_MULTIPLIER
                         all_lineups.append(chosen_df)
-                        previous_lineups.append(best_lineup)
+                        used_lineups.append(best_lineup)
 
             else:
-                # --- Standard Game Top-N ---
+                # Standard game
                 base_prob = LpProblem("NFL_DFS", LpMaximize)
                 base_prob += lpSum(x_vars[i] * df_pool.at[i,"points"] for i in df_pool.index)
                 base_prob += lpSum(x_vars[i] * df_pool.at[i,"salary"] for i in df_pool.index) <= SALARY_CAP
@@ -251,8 +258,8 @@ if uploaded_file:
                     all_lineups.append(chosen_df)
                     prob += lpSum([x_vars[i] for i in chosen]) <= len(chosen)-1
 
-            # --- Display lineups ---
+            # Display
             for idx, lineup in enumerate(all_lineups,1):
                 st.subheader(f"=== LINEUP {idx} ===")
-                st.dataframe(lineup[["name","slot","position","salary","points","dvp_rank","injury_status"]])
+                st.dataframe(lineup[["name","slot","position","team","salary","points","dvp_rank","injury_status"]])
                 st.write(f"Total Salary: {lineup['salary'].sum()} | Projected Points: {lineup['points'].sum():.2f}")
