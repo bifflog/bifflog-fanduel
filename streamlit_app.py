@@ -134,9 +134,9 @@ if uploaded_file:
             df_all_sorted = df_all.sort_values("name")
             include_cols = st.columns(2)
             for idx, row in df_all_sorted.iterrows():
-                if include_cols[0].checkbox(f"Include {row['name']} ({row['position']} ${row['salary']} {row['injury_status']})", key=f"inc_{row['id']}"):
+                if include_cols[0].checkbox(f"Include {row['name']} ({row['position']} {row['team']} ${row['salary']})", key=f"inc_{row['id']}"):
                     include_ids.append(row["id"])
-                if include_cols[1].checkbox(f"Exclude {row['name']} ({row['position']} ${row['salary']} {row['injury_status']})", key=f"exc_{row['id']}"):
+                if include_cols[1].checkbox(f"Exclude {row['name']} ({row['position']} {row['team']} ${row['salary']})", key=f"exc_{row['id']}"):
                     exclude_ids.append(row["id"])
 
     # --- Run Optimization ---
