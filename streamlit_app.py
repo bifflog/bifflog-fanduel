@@ -76,6 +76,16 @@ def get_team_code(player_team, teams):
                 return t.get("code")
     return None
 
+def get_opposing_team_code(player_raw, teams):
+    """Extract opposing team code from player JSON if available."""
+    opp = player_raw.get("sport_specific", {}).get("opposing_team", {})
+    if "_members" in opp and len(opp["_members"]) > 0:
+        opp_id = opp["_members"][0]
+        for t in teams:
+            if str(t.get("id")) == str(opp_id):
+                return t.get("code")
+    return None
+
 # === STREAMLIT APP ===
 st.title("FanDuel NFL Lineup Optimizer")
 
@@ -102,6 +112,7 @@ if uploaded_file:
             continue
         pos = canonical_position(p.get("position"))
         team_code = get_team_code(p.get("team"), teams_json)
+        opp_code = get_team_code(p.get("opposing_team"), teams_json)
         players.append({
             "id": p.get("id"),
             "name": f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
@@ -109,6 +120,7 @@ if uploaded_file:
             "salary": sal,
             "points": proj,
             "team": team_code,
+            "opp": get_opposing_team_code(p.get("raw") or p, teams_json),
             "dvp_rank": p.get("dvp_rank"),
             "injury_status": p.get("injury_status"),
             "raw": p,
@@ -261,5 +273,5 @@ if uploaded_file:
             # Display
             for idx, lineup in enumerate(all_lineups,1):
                 st.subheader(f"=== LINEUP {idx} ===")
-                st.dataframe(lineup[["name","slot","position","team","salary","points","dvp_rank","injury_status"]])
+                st.dataframe(lineup[["name","slot","position","team","salary","points","opp","dvp_rank","injury_status"]])
                 st.write(f"Total Salary: {lineup['salary'].sum()} | Projected Points: {lineup['points'].sum():.2f}")
